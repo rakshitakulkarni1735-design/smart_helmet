@@ -1,0 +1,447 @@
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WebServer.h>
+#include <math.h>
+// Function prototypes
+void handleRoot();
+void handleData();
+void handleSetLocation();
+
+
+// -------------------- Pin Definitions ----------------
+#define IR_SENSOR_PIN 32
+#define BUZZER_PIN 25
+#define SOS_TOUCH_PIN 4
+#define SDA_PIN 21
+#define SCL_PIN 22
+#define MQ2_PIN 34
+
+#define RED_PIN 23
+#define GREEN_PIN 18
+#define BLUE_PIN 21
+
+// -------------------- WiFi Credentials ----------------
+const char* ssid = "SMYS-6";
+const char* password = "SMYS@1945";
+
+// -------------------- Twilio Details -----------------
+const char* accountSID = "YOUR ACCOUNT SSID ";
+const char* authToken = "YOUR AUTHTOKEN";
+const char* twilioURL = "YOUR TWILLOURL";
+const char* twilioWhatsAppNumber = "whatsapp:TWILLO NUMBER";
+const char* recipientWhatsAppNumber = "whatsapp:YOUR NUMBER";
+
+// -------------------- Objects ------------------------
+Adafruit_MPU6050 mpu;
+WebServer server(80);
+
+// -------------------- Variables ----------------------
+bool helmetWorn = false, lastHelmetState = false;
+bool alcoholDetected = false, lastAlcoholState = false;
+bool accidentDetected = false;
+bool sosTriggered = false;
+
+float speed = 0.0;
+float latitude = 0.0, longitude = 0.0;
+
+String accidentLocation = "N/A";
+
+float baselineAx, baselineAy, baselineAz;
+float baselineRoll, baselinePitch;
+
+// MQ2 variables
+int mq2Baseline = 0;
+int alcoholThreshold = 0;
+
+// -------------------- NEW: Receive Mobile GPS --------------------
+void handleSetLocation() {
+  if (server.method() == HTTP_POST) {
+    if (server.hasArg("lat") && server.hasArg("lon")) {
+      
+      latitude = server.arg("lat").toFloat();
+      longitude = server.arg("lon").toFloat();
+
+      accidentLocation = "https://maps.google.com/?q=" +
+                         String(latitude, 6) + "," +
+                         String(longitude, 6);
+
+      Serial.print("📍 Updated Location → ");
+      Serial.print(latitude, 6);
+      Serial.print(", ");
+      Serial.println(longitude, 6);
+
+      server.send(200, "text/plain", "OK");
+    } else {
+      server.send(400, "text/plain", "Missing lat/lon");
+    }
+  }
+}
+
+// -------------------- RGB --------------------
+void setupRGB() {
+  pinMode(RED_PIN, OUTPUT);
+  pinMode(GREEN_PIN, OUTPUT);
+  pinMode(BLUE_PIN, OUTPUT);
+  digitalWrite(RED_PIN, HIGH);
+  digitalWrite(GREEN_PIN, HIGH);
+  digitalWrite(BLUE_PIN, HIGH);
+}
+
+void updateRGB() {
+  if (!helmetWorn || alcoholDetected) {
+    digitalWrite(RED_PIN, LOW);
+    digitalWrite(GREEN_PIN, HIGH);
+  } else {
+    digitalWrite(RED_PIN, HIGH);
+    digitalWrite(GREEN_PIN, LOW);
+  }
+}
+
+// -------------------- Setup --------------------
+void setup() {
+  Serial.begin(115200);
+  setupRGB();
+
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(800);
+    Serial.print(".");
+  }
+  Serial.print("\nWi-Fi connected → ");
+  Serial.println(WiFi.localIP());
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  if (!mpu.begin(0x68, &Wire)) {
+    Serial.println("MPU6050 Failed!");
+    while (1) delay(10);
+  }
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(IR_SENSOR_PIN, INPUT);
+  pinMode(SOS_TOUCH_PIN, INPUT);
+
+  calibrateMPU6050();
+  calibrateMQ2();
+
+  // -------------------- Web Server Routes --------------------
+  server.on("/", handleRoot);
+  server.on("/data", handleData);
+  server.on("/setLocation", handleSetLocation);   // ⭐ New GPS endpoint
+  server.begin();
+}
+
+// -------------------- Loop --------------------
+void loop() {
+  server.handleClient();
+  checkHelmetStatus();
+  checkAlcohol();
+  checkAccident();
+  checkSOS();
+  updateRGB();
+  updateBuzzer();
+}
+
+// -------------------- Helmet --------------------
+void checkHelmetStatus() {
+  bool current = (digitalRead(IR_SENSOR_PIN) == LOW);
+  if (current != lastHelmetState) {
+    helmetWorn = current;
+    lastHelmetState = current;
+    Serial.println(helmetWorn ? "Helmet Worn" : "Helmet Not Worn");
+  }
+}
+
+// -------------------- Alcohol --------------------
+void calibrateMQ2() {
+  long sum = 0;
+  for (int i = 0; i < 80; i++) {
+    sum += analogRead(MQ2_PIN);
+    delay(8);
+  }
+  mq2Baseline = sum / 80;
+  alcoholThreshold = mq2Baseline + 200;
+}
+
+void checkAlcohol() {
+  int val = analogRead(MQ2_PIN);
+  bool current = (val > alcoholThreshold);
+  if (current != lastAlcoholState) {
+    alcoholDetected = current;
+    lastAlcoholState = current;
+    Serial.println(alcoholDetected ? "Alcohol Detected!" : "Safe");
+  }
+}
+
+// -------------------- Accident Detection --------------------
+void calibrateMPU6050() {
+  float sumAx = 0, sumAy = 0, sumAz = 0;
+  float sumRoll = 0, sumPitch = 0;
+
+  for (int i = 0; i < 60; i++) {
+    sensors_event_t a, g, t;
+    mpu.getEvent(&a, &g, &t);
+
+    sumAx += a.acceleration.x;
+    sumAy += a.acceleration.y;
+    sumAz += a.acceleration.z;
+
+    sumRoll += atan2(a.acceleration.y, a.acceleration.z) * 180 / PI;
+    sumPitch += atan2(a.acceleration.x, sqrt(a.acceleration.y * a.acceleration.y + a.acceleration.z * a.acceleration.z)) * 180 / PI;
+
+    delay(5);
+  }
+
+  baselineAx = sumAx / 60;
+  baselineAy = sumAy / 60;
+  baselineAz = sumAz / 60;
+  baselineRoll = sumRoll / 60;
+  baselinePitch = sumPitch / 60;
+}
+
+void checkAccident() {
+  if (!helmetWorn || alcoholDetected) return;
+
+  sensors_event_t a, g, t;
+  mpu.getEvent(&a, &g, &t);
+
+  float roll = atan2(a.acceleration.y, a.acceleration.z) * 180 / PI;
+  float pitch = atan2(a.acceleration.x, sqrt(a.acceleration.y*a.acceleration.y + a.acceleration.z*a.acceleration.z)) * 180 / PI;
+
+  bool impact =
+    abs(a.acceleration.x - baselineAx) > 15 ||
+    abs(a.acceleration.y - baselineAy) > 15 ||
+    abs(a.acceleration.z - baselineAz) > 15;
+
+  bool tilt =
+    abs(roll - baselineRoll) > 45 ||
+    abs(pitch - baselinePitch) > 45;
+
+  if (impact && tilt) {
+    accidentDetected = true;
+    Serial.println("Accident Detected!");
+    Serial.println(accidentLocation);
+
+    unsigned long start = millis();
+    bool cancel = false;
+
+    while (millis() - start < 5000) {
+      if (digitalRead(SOS_TOUCH_PIN) == HIGH) {
+        cancel = true;
+        Serial.println("False Alarm");
+        break;
+      }
+    }
+
+    if (!cancel) {
+      sendWhatsAppMessage("Accident Detected!\nLocation:\n" + accidentLocation);
+    }
+  }
+}
+
+// -------------------- SOS --------------------
+void checkSOS() {
+  if (digitalRead(SOS_TOUCH_PIN) == HIGH) {
+    sosTriggered = true;
+    sendWhatsAppMessage("Manual SOS Triggered!\nLocation:\n" + accidentLocation);
+    delay(1000);
+  } else {
+    sosTriggered = false;
+  }
+}
+
+// -------------------- Buzzer --------------------
+void updateBuzzer() {
+  if (!helmetWorn || alcoholDetected || accidentDetected)
+    digitalWrite(BUZZER_PIN, HIGH);
+  else
+    digitalWrite(BUZZER_PIN, LOW);
+}
+
+// -------------------- WhatsApp --------------------
+void sendWhatsAppMessage(String msg) {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  http.begin(twilioURL);
+  http.setAuthorization(accountSID, authToken);
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+
+  String body = "To=" + String(recipientWhatsAppNumber) +
+                "&From=" + String(twilioWhatsAppNumber) +
+                "&Body=" + msg;
+
+  http.POST(body);
+  http.end();
+}
+
+// -------------------- DASHBOARD --------------------
+void handleRoot() {
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Smart Helmet Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body {
+      margin: 0;
+      font-family: Arial, sans-serif;
+      background: #1a2a3a;
+      color: white;
+    }
+    header {
+      background: #0d1b2a;
+      padding: 15px;
+      text-align: center;
+      font-size: 24px;
+      font-weight: bold;
+      color: #f8f9fa;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: 2fr 1fr;
+      gap: 20px;
+      padding: 20px;
+    }
+    .card {
+      background: #243447;
+      border-radius: 12px;
+      padding: 15px;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+    }
+    .status-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 15px;
+      padding: 20px;
+    }
+    .status-card {
+      background: #243447;
+      border-radius: 12px;
+      padding: 15px;
+      text-align: center;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+    }
+    .status-ok { color: #4caf50; font-weight: bold; }
+    .status-alert { color: #ff5252; font-weight: bold; }
+    iframe {
+      width: 100%;
+      height: 300px;
+      border: none;
+      border-radius: 12px;
+    }
+    canvas {
+      width: 100%;
+      max-width: 250px;
+      height: 200px;
+    }
+  </style>
+</head>
+<body>
+  <header>Smart Helmet Dashboard</header>
+
+  <div class="grid">
+    <div class="card">
+      <h2>📍 Live Location</h2>
+      <iframe id="mapFrame" src=""></iframe>
+    </div>
+
+    <div class="card">
+      <h2>⏱ Speedometer</h2>
+      <canvas id="gauge"></canvas>
+      <p id="speedText">Speed: 0 km/h</p>
+    </div>
+  </div>
+
+  <div class="status-grid">
+    <div class="status-card">
+      <h3>🪖 Helmet Status</h3>
+      <p id="helmet" class="status-ok">Loading...</p>
+    </div>
+    <div class="status-card">
+      <h3>🍺 Alcohol Status</h3>
+      <p id="alcohol" class="status-ok">Loading...</p>
+    </div>
+    <div class="status-card">
+      <h3>💥 Accident Status</h3>
+      <p id="accident" class="status-ok">Loading...</p>
+    </div>
+    <div class="status-card">
+      <h3>🆘 SOS Status</h3>
+      <p id="sos" class="status-ok">Loading...</p>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script>
+    let ctx = document.getElementById('gauge').getContext('2d');
+    let gaugeChart = new Chart(ctx, {
+      type: 'doughnut',
+      data: {
+        datasets: [{
+          data: [0, 100],
+          backgroundColor: ['#1e90ff','#2e3b4e'],
+          borderWidth: 0
+        }]
+      },
+      options: {
+        rotation: -90,
+        circumference: 180,
+        cutout: '70%',
+        plugins: {legend:{display:false}}
+      }
+    });
+
+    function updateDashboard() {
+      fetch('/data')
+        .then(res => res.json())
+        .then(data => {
+          document.getElementById('helmet').textContent = data.helmet ? "Worn" : "Not Worn";
+          document.getElementById('helmet').className = data.helmet ? "status-ok" : "status-alert";
+
+          document.getElementById('alcohol').textContent = data.alcohol ? "Detected!" : "Safe";
+          document.getElementById('alcohol').className = data.alcohol ? "status-alert" : "status-ok";
+
+          document.getElementById('accident').textContent = data.accident ? "Accident!" : "Normal";
+          document.getElementById('accident').className = data.accident ? "status-alert" : "status-ok";
+
+          document.getElementById('sos').textContent = data.sos ? "SOS Triggered!" : "Normal";
+          document.getElementById('sos').className = data.sos ? "status-alert" : "status-ok";
+
+          document.getElementById('speedText').textContent = "Speed: " + data.speed + " km/h";
+          gaugeChart.data.datasets[0].data[0] = data.speed;
+          gaugeChart.data.datasets[0].data[1] = Math.max(0, 100 - data.speed);
+          gaugeChart.update();
+
+          document.getElementById("mapFrame").src =
+            "https://maps.google.com/maps?q=" + data.lat + "," + data.lon + "&z=15&output=embed";
+        });
+    }
+    setInterval(updateDashboard, 2000);
+    updateDashboard();
+  </script>
+</body>
+</html>
+)rawliteral";
+
+  server.send(200, "text/html", html);
+}
+
+
+void handleData() {
+  String json = "{";
+  json += "\"helmet\":" + String(helmetWorn ? "true" : "false") + ",";
+  json += "\"alcohol\":" + String(alcoholDetected ? "true" : "false") + ",";
+  json += "\"accident\":" + String(accidentDetected ? "true" : "false") + ",";
+  json += "\"sos\":" + String(sosTriggered ? "true" : "false") + ",";
+  json += "\"speed\":" + String(speed, 1) + ",";
+  json += "\"lat\":" + String(latitude, 6) + ",";
+  json += "\"lon\":" + String(longitude, 6);
+  json += "}";
+  server.send(200, "application/json", json);
+}
